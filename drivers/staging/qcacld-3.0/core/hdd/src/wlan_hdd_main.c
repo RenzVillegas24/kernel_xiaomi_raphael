@@ -30,6 +30,18 @@
 #include <wlan_hdd_includes.h>
 #include <cds_api.h>
 #include <cds_sched.h>
+#include "../../wma/inc/wma_frame_inject.h"
+
+/*
+ * Minimal radiotap header layout. Avoid including net/ieee80211_radiotap.h:
+ * its IEEE80211_CHAN_* macros collide with wlan headers pulled in here.
+ */
+struct hdd_minimal_radiotap_header {
+	uint8_t it_version;
+	uint8_t it_pad;
+	__le16 it_len;
+	__le32 it_present;
+};
 #include <linux/cpu.h>
 #include <linux/etherdevice.h>
 #include <linux/firmware.h>
@@ -2621,6 +2633,11 @@ static void hdd_mon_turn_off_ps_and_wow(struct hdd_context *hdd_ctx)
  *
  * Return: 0 for success; non-zero for failure
  */
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+static int hdd_inject_get_tx_vdev_id(struct hdd_context *hdd_ctx,
+				     bool rtnl_held);
+#endif
+
 static int __hdd_mon_open(struct net_device *dev)
 {
 	int ret;
@@ -2660,6 +2677,20 @@ static int __hdd_mon_open(struct net_device *dev)
 
 	if (!ret)
 		ret = hdd_enable_monitor_mode(dev);
+
+	/* Monitor mode was RX-only: bring up carrier and TX queues so the
+	 * injection xmit hook can be reached.
+	 */
+	if (!ret)
+		wlan_hdd_netif_queue_control(adapter,
+			WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+			WLAN_CONTROL_PATH);
+
+	/* Create the hidden STA vdev here, in process/RTNL context, rather
+	 * than on the first monitor TX in softirq context.
+	 */
+	if (!ret)
+		(void)hdd_inject_get_tx_vdev_id(hdd_ctx, true);
 
 	if (!ret) {
 		hdd_set_current_throughput_level(hdd_ctx,
@@ -4858,11 +4889,97 @@ static const struct net_device_ops wlan_drv_ops = {
 };
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
-/* Monitor mode net_device_ops, doesnot Tx and most of operations. */
+
+/* Cached vdev id of the hidden injection-only STA adapter, or -1. */
+static int g_hdd_inject_tx_vdev_id = -1;
+
+/**
+ * hdd_inject_get_tx_vdev_id() - get/create a real non-monitor vdev for TX
+ * @hdd_ctx: global HDD context
+ *
+ * Firmware silently drops management TX from a monitor-type vdev. Create a
+ * hidden, fully initialized STA adapter through the driver's normal adapter
+ * path and borrow its vdev id for injected frames.
+ *
+ * Return: vdev id, or -1 on failure
+ */
+static int hdd_inject_get_tx_vdev_id(struct hdd_context *hdd_ctx,
+				     bool rtnl_held)
+{
+	struct hdd_adapter *inj_adapter;
+	uint8_t *mac_addr;
+
+	if (g_hdd_inject_tx_vdev_id >= 0)
+		return g_hdd_inject_tx_vdev_id;
+
+	mac_addr = wlan_hdd_get_intf_addr(hdd_ctx, QDF_STA_MODE);
+	if (!mac_addr) {
+		hdd_err("wma_inject: no free MAC address for injection adapter");
+		return -1;
+	}
+
+	inj_adapter = hdd_open_adapter(hdd_ctx, QDF_STA_MODE, "wlan_inj%d",
+				       mac_addr, NET_NAME_UNKNOWN, rtnl_held);
+	if (!inj_adapter) {
+		hdd_err("wma_inject: hdd_open_adapter failed");
+		wlan_hdd_release_intf_addr(hdd_ctx, mac_addr);
+		return -1;
+	}
+
+	if (hdd_start_adapter(inj_adapter)) {
+		hdd_err("wma_inject: hdd_start_adapter failed");
+		return -1;
+	}
+
+	g_hdd_inject_tx_vdev_id = inj_adapter->vdev_id;
+	hdd_debug("wma_inject: injection tx vdev ready, vdev_id=%d",
+		  g_hdd_inject_tx_vdev_id);
+	return g_hdd_inject_tx_vdev_id;
+}
+
+/**
+ * hdd_mon_hard_start_xmit() - inject a raw 802.11 frame from monitor mode
+ * @skb: frame including radiotap header
+ * @dev: monitor-mode net_device
+ *
+ * Return: NETDEV_TX_OK
+ */
+static netdev_tx_t hdd_mon_hard_start_xmit(struct sk_buff *skb,
+					   struct net_device *dev)
+{
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	struct hdd_context *hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+	void *wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+	struct hdd_minimal_radiotap_header *rtap;
+	uint32_t rtap_len;
+	int tx_vdev_id;
+
+	if (!wma_handle || skb->len < sizeof(*rtap))
+		goto drop;
+
+	rtap = (struct hdd_minimal_radiotap_header *)skb->data;
+	rtap_len = qdf_le16_to_cpu(rtap->it_len);
+	if (rtap_len >= skb->len)
+		goto drop;
+
+	tx_vdev_id = hdd_inject_get_tx_vdev_id(hdd_ctx, false);
+	if (tx_vdev_id < 0)
+		goto drop;
+
+	wma_inject_frame_via_vdev(wma_handle, (uint8_t)tx_vdev_id,
+				  skb->data + rtap_len, skb->len - rtap_len);
+
+drop:
+	kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+/* Monitor mode net_device_ops. RX-only upstream; injection xmit added. */
 static const struct net_device_ops wlan_mon_drv_ops = {
 	.ndo_open = hdd_mon_open,
 	.ndo_stop = hdd_stop,
 	.ndo_get_stats = hdd_get_stats,
+	.ndo_start_xmit = hdd_mon_hard_start_xmit,
 };
 
 #ifdef WLAN_FEATURE_TSF_PTP
@@ -7998,6 +8115,20 @@ QDF_STATUS hdd_start_all_adapters(struct hdd_context *hdd_ctx)
 
 	hdd_for_each_adapter_dev_held_safe(hdd_ctx, adapter, next_adapter,
 					   dbgid) {
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+		/* The hidden injection adapter never brings its netdev up, so
+		 * the normal interface-up gate would skip it after SSR.
+		 */
+		if (g_hdd_inject_tx_vdev_id >= 0 &&
+		    !strncmp(adapter->dev->name, "wlan_inj", 8)) {
+			hdd_start_adapter(adapter);
+			g_hdd_inject_tx_vdev_id = adapter->vdev_id;
+			hdd_debug("wma_inject: revived injection vdev after SSR, vdev_id=%d",
+				  g_hdd_inject_tx_vdev_id);
+			hdd_adapter_dev_put_debug(adapter, dbgid);
+			continue;
+		}
+#endif
 		if (!hdd_is_interface_up(adapter) &&
 		    adapter->device_mode != QDF_NDI_MODE) {
 			hdd_adapter_dev_put_debug(adapter, dbgid);
