@@ -4918,21 +4918,6 @@ static int hdd_inject_get_tx_vdev_id(struct hdd_context *hdd_ctx,
 		return -1;
 	}
 
-	/*
-	 * The userspace AWDL node (awdl0) is built on this address. The driver's
-	 * normal free-address pool gave the hidden STA a different MAC
-	 * (e0:dc:ff:80:c5:93), while injected frames carried the AWDL MAC
-	 * (e2:dc:ff:f9:c5:93). The first data frame could leave, but later
-	 * unicast frames and ACK handling stopped. Pin the hidden injection
-	 * vdev to the AWDL address so the firmware sees one transmitter.
-	 */
-	mac_addr[0] = 0xe2;
-	mac_addr[1] = 0xdc;
-	mac_addr[2] = 0xff;
-	mac_addr[3] = 0xf9;
-	mac_addr[4] = 0xc5;
-	mac_addr[5] = 0x93;
-
 	inj_adapter = hdd_open_adapter(hdd_ctx, QDF_STA_MODE, "wlan_inj%d",
 				       mac_addr, NET_NAME_UNKNOWN, rtnl_held);
 	if (!inj_adapter) {
