@@ -46,6 +46,7 @@ struct hdd_minimal_radiotap_header {
 #include <linux/etherdevice.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
+#include <linux/pid.h>
 #include <wlan_hdd_tx_rx.h>
 #include <wni_api.h>
 #include <wlan_hdd_cfg.h>
@@ -16577,6 +16578,126 @@ exit:
 	return errno;
 }
 
+/*
+ * Owly monitor owner watchdog.
+ *
+ * The app writes its PID to /sys/module/wlan/parameters/owly_owner_pid while
+ * AirDrop mode is active. If the app process disappears (force-stop, crash,
+ * LMK), the driver returns to mission mode so normal Wi-Fi can recover.
+ */
+#define OWLY_OWNER_POLL_MS 500
+
+static DEFINE_MUTEX(owly_owner_lock);
+static struct pid *owly_owner_pid;
+static int owly_owner_pid_nr;
+static unsigned long owly_owner_generation;
+static struct delayed_work owly_owner_work;
+
+static void owly_owner_work_fn(struct work_struct *work)
+{
+	struct pid *pid;
+	struct task_struct *task;
+	unsigned long generation;
+	bool alive;
+	bool revert = false;
+
+	mutex_lock(&owly_owner_lock);
+	pid = owly_owner_pid;
+	generation = owly_owner_generation;
+	if (pid)
+		get_pid(pid);
+	mutex_unlock(&owly_owner_lock);
+
+	if (!pid)
+		return;
+
+	task = get_pid_task(pid, PIDTYPE_PID);
+	alive = task != NULL;
+	if (task)
+		put_task_struct(task);
+
+	if (alive) {
+		schedule_delayed_work(&owly_owner_work,
+				      msecs_to_jiffies(OWLY_OWNER_POLL_MS));
+		put_pid(pid);
+		return;
+	}
+
+	mutex_lock(&owly_owner_lock);
+	if (owly_owner_pid == pid && owly_owner_generation == generation) {
+		put_pid(owly_owner_pid);
+		owly_owner_pid = NULL;
+		owly_owner_pid_nr = 0;
+		revert = true;
+	}
+	mutex_unlock(&owly_owner_lock);
+	put_pid(pid);
+
+	if (revert && hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE) {
+		hdd_info("Owly owner exited; reverting to mission mode");
+		hdd_driver_mode_change(QDF_GLOBAL_MISSION_MODE);
+	}
+}
+
+static int owly_owner_pid_set(const char *kmessage,
+			      const struct kernel_param *kp)
+{
+	struct pid *new_pid = NULL;
+	struct pid *old_pid;
+	int nr;
+	int ret;
+
+	ret = kstrtoint(kmessage, 10, &nr);
+	if (ret)
+		return ret;
+
+	if (nr > 0) {
+		new_pid = find_get_pid(nr);
+		if (!new_pid)
+			return -ESRCH;
+	}
+
+	mutex_lock(&owly_owner_lock);
+	old_pid = owly_owner_pid;
+	owly_owner_pid = new_pid;
+	owly_owner_pid_nr = nr > 0 ? nr : 0;
+	owly_owner_generation++;
+	mutex_unlock(&owly_owner_lock);
+
+	put_pid(old_pid);
+	cancel_delayed_work_sync(&owly_owner_work);
+
+	if (new_pid)
+		schedule_delayed_work(&owly_owner_work,
+				      msecs_to_jiffies(OWLY_OWNER_POLL_MS));
+
+	return 0;
+}
+
+static const struct kernel_param_ops owly_owner_pid_ops = {
+	.set = owly_owner_pid_set,
+	.get = param_get_int,
+};
+
+static void owly_owner_init(void)
+{
+	INIT_DELAYED_WORK(&owly_owner_work, owly_owner_work_fn);
+}
+
+static void owly_owner_exit(void)
+{
+	struct pid *pid;
+
+	cancel_delayed_work_sync(&owly_owner_work);
+	mutex_lock(&owly_owner_lock);
+	pid = owly_owner_pid;
+	owly_owner_pid = NULL;
+	owly_owner_pid_nr = 0;
+	owly_owner_generation++;
+	mutex_unlock(&owly_owner_lock);
+	put_pid(pid);
+}
+
 static int hdd_set_con_mode(enum QDF_GLOBAL_MODE mode)
 {
 	con_mode = mode;
@@ -16816,6 +16937,7 @@ static int hdd_module_init(void)
 {
 	int ret;
 
+	owly_owner_init();
 	ret = wlan_hdd_state_ctrl_param_create();
 	if (ret)
 		pr_err("wlan_hdd_state_create:%x\n", ret);
@@ -16832,6 +16954,7 @@ static int hdd_module_init(void)
  */
 static void __exit hdd_module_exit(void)
 {
+	owly_owner_exit();
 	hdd_driver_unload();
 }
 
@@ -18277,6 +18400,8 @@ static const struct kernel_param_ops fwpath_ops = {
 
 module_param_cb(con_mode, &con_mode_ops, &con_mode,
 		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+module_param_cb(owly_owner_pid, &owly_owner_pid_ops, &owly_owner_pid_nr, 0644);
 
 module_param_cb(con_mode_ftm, &con_mode_ftm_ops, &con_mode_ftm,
 		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
