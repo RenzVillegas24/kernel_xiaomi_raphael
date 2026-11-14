@@ -4893,6 +4893,19 @@ static const struct net_device_ops wlan_drv_ops = {
 /* Cached vdev id of the hidden injection-only STA adapter, or -1. */
 static int g_hdd_inject_tx_vdev_id = -1;
 
+/*
+ * The hidden injection adapter is destroyed with the monitor adapters during
+ * a mode change. Drop the cached id so the next monitor open recreates it
+ * instead of returning a stale vdev id.
+ */
+static void hdd_inject_reset_tx_vdev_id(void)
+{
+	if (g_hdd_inject_tx_vdev_id >= 0)
+		hdd_info("wma_inject: clearing cached tx vdev %d",
+			 g_hdd_inject_tx_vdev_id);
+	g_hdd_inject_tx_vdev_id = -1;
+}
+
 /**
  * hdd_inject_get_tx_vdev_id() - get/create a real non-monitor vdev for TX
  * @hdd_ctx: global HDD context
@@ -16345,6 +16358,7 @@ static void hdd_stop_present_mode(struct hdd_context *hdd_ctx,
 		hdd_info("Release wakelock for monitor mode!");
 		qdf_wake_lock_release(&hdd_ctx->monitor_mode_wakelock,
 				      WIFI_POWER_EVENT_WAKELOCK_MONITOR_MODE);
+		hdd_inject_reset_tx_vdev_id();
 		/* fallthrough */
 	case QDF_GLOBAL_MISSION_MODE:
 	case QDF_GLOBAL_FTM_MODE:
