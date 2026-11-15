@@ -2690,22 +2690,6 @@ enum QDF_GLOBAL_MODE hdd_get_conparam(void);
 void wlan_hdd_reset_prob_rspies(struct hdd_adapter *adapter);
 void hdd_prevent_suspend(uint32_t reason);
 
-/**
- * hdd_owly_owner_suspend() - pause the Owly monitor owner watchdog
- *
- * Called from the platform suspend path so the watchdog stops re-arming
- * its delayed work while the system is suspended.
- */
-void hdd_owly_owner_suspend(void);
-
-/**
- * hdd_owly_owner_resume() - resume the Owly monitor owner watchdog
- *
- * Called from the platform resume path to re-arm the watchdog if an owner
- * is still registered and the state machine is not idle.
- */
-void hdd_owly_owner_resume(void);
-
 /*
  * hdd_get_first_valid_adapter() - Get the first valid adapter from adapter list
  *
