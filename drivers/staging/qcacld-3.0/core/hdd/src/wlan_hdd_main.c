@@ -16544,7 +16544,8 @@ static int __hdd_driver_mode_change(struct hdd_context *hdd_ctx,
 	return 0;
 }
 
-static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
+static int hdd_driver_mode_change_common(enum QDF_GLOBAL_MODE mode,
+					 bool wait)
 {
 	struct osif_driver_sync *driver_sync;
 	struct hdd_context *hdd_ctx;
@@ -16553,9 +16554,22 @@ static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
 
 	hdd_enter();
 
-	status = osif_driver_sync_trans_start_wait(&driver_sync);
+	/*
+	 * The wait variant is used by the con_mode sysfs path, which must
+	 * preserve the existing blocking semantics.  The watchdog uses the
+	 * non-blocking variant so it can back off instead of queueing a
+	 * revert behind an in-flight user transition.
+	 */
+	if (wait)
+		status = osif_driver_sync_trans_start_wait(&driver_sync);
+	else
+		status = osif_driver_sync_trans_start(&driver_sync);
 	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_err("Failed to start 'mode change'; status:%u", status);
+		if (!wait && status == QDF_STATUS_E_AGAIN)
+			hdd_info_rl("Mode change transition busy; deferring");
+		else
+			hdd_err("Failed to start 'mode change'; status:%u",
+				status);
 		errno = qdf_status_to_os_return(status);
 		goto exit;
 	}
@@ -16567,6 +16581,17 @@ static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
 	if (errno)
 		goto trans_stop;
 
+	/*
+	 * The watchdog must not start a full driver stop/restart while the
+	 * wiphy is suspended.  Re-check here as well: the suspend flag can
+	 * change between the caller's check and this point.
+	 */
+	if (!wait && hdd_ctx->is_wiphy_suspended) {
+		hdd_info_rl("Mode change deferred: wiphy suspended");
+		errno = -EAGAIN;
+		goto trans_stop;
+	}
+
 	errno = __hdd_driver_mode_change(hdd_ctx, mode);
 
 trans_stop:
@@ -16576,6 +16601,16 @@ exit:
 	hdd_exit();
 
 	return errno;
+}
+
+static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
+{
+	return hdd_driver_mode_change_common(mode, true);
+}
+
+static int hdd_driver_mode_change_nowait(enum QDF_GLOBAL_MODE mode)
+{
+	return hdd_driver_mode_change_common(mode, false);
 }
 
 /*
@@ -16589,166 +16624,387 @@ exit:
  * owly_owner_generation.  A callback only acts if both the captured pid
  * pointer and generation still match the current registration, so a work item
  * queued for an old owner can never revert a new owner's monitor session.
+ *
+ * A single delayed work drives an explicit state machine:
+ *
+ *   IDLE      - no owner registered
+ *   POLLING   - owner registered, check liveness every OWLY_OWNER_POLL_MS
+ *   GRACE     - owner is gone; defer the revert and re-check owner,
+ *               generation and con_mode every OWLY_OWNER_GRACE_STEP_MS until
+ *               OWLY_OWNER_GRACE_MS expires
+ *   REVERTING - a revert attempt is in flight or waiting for a bounded retry
+ *
+ * The grace window is deliberately longer than the root watchdog's exit path
+ * (svc wifi disable, sleep 2, con_mode=0).  If userspace restores mission mode
+ * first, the kernel stops without touching the driver.  The kernel only forces
+ * the revert if con_mode is still monitor at the deadline.
  */
-#define OWLY_OWNER_POLL_MS 500
-#define OWLY_OWNER_GRACE_MS 1500
+#define OWLY_OWNER_POLL_MS 1000
+#define OWLY_OWNER_GRACE_MS 7000
+#define OWLY_OWNER_GRACE_STEP_MS 500
+#define OWLY_OWNER_REVERT_RETRY_MS 1000
+#define OWLY_OWNER_REVERT_MAX_ATTEMPTS 3
+#define OWLY_OWNER_SUSPEND_RETRY_MS 5000
+
+enum owly_owner_state {
+	OWLY_OWNER_IDLE,
+	OWLY_OWNER_POLLING,
+	OWLY_OWNER_GRACE,
+	OWLY_OWNER_REVERTING,
+};
 
 static DEFINE_MUTEX(owly_owner_lock);
 static struct pid *owly_owner_pid;
 static int owly_owner_pid_nr;
 static unsigned long owly_owner_generation;
-static struct delayed_work owly_owner_poll_work;
-static struct delayed_work owly_owner_grace_work;
-static struct pid *owly_grace_pid;
-static unsigned long owly_grace_generation;
+static enum owly_owner_state owly_owner_state;
+static unsigned long owly_grace_deadline;
+static unsigned int owly_revert_attempt;
+static struct delayed_work owly_owner_work;
 static struct workqueue_struct *owly_owner_wq;
 
 /*
  * hdd_driver_mode_change() performs a full driver stop/restart and can sleep
  * for a long time.  Keep it on a dedicated ordered workqueue instead of
- * system_wq so it neither delays unrelated system work nor races the poll
- * callback.  Fall back to system_wq only if allocation fails.
+ * system_wq so it neither delays unrelated system work nor races the state
+ * machine.  The workqueue is deliberately not WQ_FREEZABLE: a frozen worker
+ * would make the sysfs set path's asynchronous cancel ineffective until thaw.
+ * Fall back to system_wq only if allocation fails.
  */
-static void owly_owner_queue(struct delayed_work *work, unsigned long delay)
+static void owly_owner_rearm(unsigned long delay_ms)
 {
 	if (owly_owner_wq)
-		queue_delayed_work(owly_owner_wq, work, delay);
+		queue_delayed_work(owly_owner_wq, &owly_owner_work,
+				   msecs_to_jiffies(delay_ms));
 	else
-		schedule_delayed_work(work, delay);
+		schedule_delayed_work(&owly_owner_work,
+				      msecs_to_jiffies(delay_ms));
 }
 
-static void owly_owner_poll_fn(struct work_struct *work)
+/* Caller must hold owly_owner_lock. */
+static bool owly_owner_matches_locked(struct pid *pid,
+				      unsigned long generation,
+				      enum owly_owner_state state)
 {
-	struct pid *pid;
+	return owly_owner_pid == pid &&
+	       owly_owner_generation == generation &&
+	       owly_owner_state == state;
+}
+
+static void owly_owner_poll_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
 	struct task_struct *task;
-	unsigned long generation;
 	bool alive;
-	bool still_owner;
-	bool queue_grace = false;
 
-	mutex_lock(&owly_owner_lock);
-	pid = owly_owner_pid;
-	generation = owly_owner_generation;
-	if (pid)
-		get_pid(pid);
-	mutex_unlock(&owly_owner_lock);
-
-	if (!pid)
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		/*
+		 * Do not poll or start a grace/revert while the wiphy is
+		 * suspended.  The driver cannot be restarted safely, and a
+		 * longer interval avoids 1 s wakeups through suspend.
+		 */
+		mutex_lock(&owly_owner_lock);
+		if (owly_owner_matches_locked(pid, generation,
+					      OWLY_OWNER_POLLING)) {
+			mutex_unlock(&owly_owner_lock);
+			hdd_info_rl("Owly owner poll deferred: wiphy suspended");
+			owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+			return;
+		}
+		mutex_unlock(&owly_owner_lock);
 		return;
+	}
 
 	task = get_pid_task(pid, PIDTYPE_PID);
-	alive = task != NULL;
+	/*
+	 * A zombie still has a task_struct until it is reaped.  Do not report
+	 * it as a live owner: exit_state is set as soon as do_exit() runs.
+	 */
+	alive = task && !READ_ONCE(task->exit_state);
 	if (task)
 		put_task_struct(task);
 
-	if (alive) {
-		/*
-		 * The owner may have been replaced while the task lookup ran.
-		 * Only reschedule if this work still belongs to the registered
-		 * owner; the set path queues a fresh poll for a new owner.
-		 */
-		mutex_lock(&owly_owner_lock);
-		still_owner = owly_owner_pid == pid &&
-			      owly_owner_generation == generation;
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation, OWLY_OWNER_POLLING)) {
 		mutex_unlock(&owly_owner_lock);
+		return;
+	}
 
-		if (still_owner)
-			owly_owner_queue(&owly_owner_poll_work,
-					 msecs_to_jiffies(OWLY_OWNER_POLL_MS));
-		put_pid(pid);
+	if (alive) {
+		mutex_unlock(&owly_owner_lock);
+		owly_owner_rearm(OWLY_OWNER_POLL_MS);
+		return;
+	}
+
+	owly_owner_state = OWLY_OWNER_GRACE;
+	owly_grace_deadline = jiffies + msecs_to_jiffies(OWLY_OWNER_GRACE_MS);
+	mutex_unlock(&owly_owner_lock);
+
+	hdd_info("Owly owner exited; deferring revert for %d ms",
+		 OWLY_OWNER_GRACE_MS);
+	owly_owner_rearm(OWLY_OWNER_GRACE_STEP_MS);
+}
+
+static void owly_owner_grace_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
+	enum QDF_GLOBAL_MODE mode;
+	bool deadline = false;
+	bool deferred = false;
+	bool revert = false;
+	int deferred_mode = 0;
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation, OWLY_OWNER_GRACE)) {
+		mutex_unlock(&owly_owner_lock);
+		return;
+	}
+	deadline = time_after_eq(jiffies, owly_grace_deadline);
+	mutex_unlock(&owly_owner_lock);
+
+	mode = hdd_get_conparam();
+	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		mutex_lock(&owly_owner_lock);
+		if (owly_owner_matches_locked(pid, generation,
+					      OWLY_OWNER_GRACE)) {
+			/*
+			 * Userspace already restored mission mode.  No kernel
+			 * revert is needed, so clear the dead owner as
+			 * cleanup and stop the watchdog.
+			 */
+			put_pid(owly_owner_pid);
+			owly_owner_pid = NULL;
+			owly_owner_pid_nr = 0;
+			owly_owner_generation++;
+			owly_owner_state = OWLY_OWNER_IDLE;
+			owly_grace_deadline = 0;
+			deferred = true;
+			deferred_mode = mode;
+		}
+		mutex_unlock(&owly_owner_lock);
+		if (deferred)
+			hdd_info("Owly owner exited; userspace restored con_mode=%d, kernel deferred",
+				 deferred_mode);
+		return;
+	}
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		/*
+		 * Do not start a full driver stop/restart while the wiphy is
+		 * suspended.  Keep the owner and re-check after resume.
+		 */
+		hdd_info_rl("Owly owner revert deferred: wiphy suspended");
+		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+		return;
+	}
+
+	if (!deadline) {
+		owly_owner_rearm(OWLY_OWNER_GRACE_STEP_MS);
+		return;
+	}
+
+	mutex_lock(&owly_owner_lock);
+	if (owly_owner_matches_locked(pid, generation, OWLY_OWNER_GRACE)) {
+		owly_owner_state = OWLY_OWNER_REVERTING;
+		owly_revert_attempt = 1;
+		revert = true;
+	}
+	mutex_unlock(&owly_owner_lock);
+
+	if (revert) {
+		hdd_info("Owly owner still gone after %d ms; starting revert",
+			 OWLY_OWNER_GRACE_MS);
+		owly_owner_rearm(0);
+	}
+}
+
+static void owly_owner_revert_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
+	enum QDF_GLOBAL_MODE mode;
+	unsigned int attempt;
+	int ret;
+	bool retry = false;
+	bool clear = false;
+	bool success = false;
+	bool deferred = false;
+	int deferred_mode = 0;
+	unsigned long delay = 0;
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		return;
+	}
+	attempt = owly_revert_attempt;
+	mutex_unlock(&owly_owner_lock);
+
+	/*
+	 * Re-check con_mode here as well.  The grace step checked it before
+	 * handing over to this work item, but userspace can restore mission
+	 * mode in between.  Never start a driver restart if that happened.
+	 */
+	mode = hdd_get_conparam();
+	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		mutex_lock(&owly_owner_lock);
+		if (owly_owner_matches_locked(pid, generation,
+					      OWLY_OWNER_REVERTING)) {
+			put_pid(owly_owner_pid);
+			owly_owner_pid = NULL;
+			owly_owner_pid_nr = 0;
+			owly_owner_generation++;
+			owly_owner_state = OWLY_OWNER_IDLE;
+			owly_grace_deadline = 0;
+			owly_revert_attempt = 0;
+			deferred = true;
+			deferred_mode = mode;
+		}
+		mutex_unlock(&owly_owner_lock);
+		if (deferred)
+			hdd_info("Owly owner exited; userspace restored con_mode=%d, kernel deferred",
+				 deferred_mode);
+		return;
+	}
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		hdd_info_rl("Owly owner revert deferred: wiphy suspended");
+		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
 		return;
 	}
 
 	/*
-	 * The owner is gone, but do not revert yet.  The root watchdog gets
-	 * OWLY_OWNER_GRACE_MS to run "owly-mode.sh exit" (svc wifi disable ->
-	 * con_mode=0 -> svc wifi enable).  A delayed work item performs the
-	 * grace check; sleeping here would stall the workqueue.
+	 * Re-check immediately before starting the transition.  This cannot
+	 * be atomic with the call because hdd_driver_mode_change_nowait()
+	 * sleeps, but it narrows the window in which a new owner can be
+	 * replaced by an in-flight revert.
 	 */
 	mutex_lock(&owly_owner_lock);
-	still_owner = owly_owner_pid == pid &&
-		      owly_owner_generation == generation;
-	if (still_owner && !owly_grace_pid) {
-		get_pid(pid);
-		owly_grace_pid = pid;
-		owly_grace_generation = generation;
-		queue_grace = true;
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		return;
 	}
 	mutex_unlock(&owly_owner_lock);
-	put_pid(pid);
 
-	if (queue_grace)
-		owly_owner_queue(&owly_owner_grace_work,
-				 msecs_to_jiffies(OWLY_OWNER_GRACE_MS));
-}
-
-static void owly_owner_grace_fn(struct work_struct *work)
-{
-	struct pid *pid;
-	unsigned long generation;
-	unsigned long cleared_generation = 0;
-	enum QDF_GLOBAL_MODE mode;
-	bool revert = false;
+	hdd_info("Owly owner exited; reverting to mission mode (attempt %u/%d)",
+		 attempt, OWLY_OWNER_REVERT_MAX_ATTEMPTS);
+	ret = hdd_driver_mode_change_nowait(QDF_GLOBAL_MISSION_MODE);
 
 	mutex_lock(&owly_owner_lock);
-	pid = owly_grace_pid;
-	generation = owly_grace_generation;
-	owly_grace_pid = NULL;
-	owly_grace_generation = 0;
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		return;
+	}
 
-	if (pid && owly_owner_pid == pid &&
-	    owly_owner_generation == generation) {
+	if (!ret) {
 		/*
-		 * Same dead owner is still registered.  Drop the ownership and
-		 * bump the generation so any stale callback fails its checks.
+		 * Success: only now is it safe to drop the owner.  Keeping it
+		 * registered until here means a failure can be retried without
+		 * losing track of the session that needs reverting.
 		 */
 		put_pid(owly_owner_pid);
 		owly_owner_pid = NULL;
 		owly_owner_pid_nr = 0;
 		owly_owner_generation++;
-		cleared_generation = owly_owner_generation;
-		revert = true;
-	}
-	mutex_unlock(&owly_owner_lock);
-	put_pid(pid);
-
-	if (!revert)
-		return;
-
-	mode = hdd_get_conparam();
-	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		owly_owner_state = OWLY_OWNER_IDLE;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		clear = true;
+		success = true;
+	} else if (ret == -EAGAIN) {
 		/*
-		 * The root watchdog already restored mission mode (or the mode
-		 * changed for another reason).  Never override that from the
-		 * kernel.
+		 * A driver transition is already active or queued (for example
+		 * the user's con_mode=4 or the root watchdog's con_mode=0).
+		 * Do not queue this revert behind it; go back to polling and
+		 * re-evaluate once that transition settles.
 		 */
-		hdd_info("Owly owner exited; con_mode already %d, no revert",
-			 mode);
-		return;
-	}
-
-	/*
-	 * Re-check after clearing ownership.  The set path cancels the grace
-	 * work before publishing a new owner, so a normal write cannot land
-	 * between these steps; this check is a defensive backstop in case
-	 * ownership is ever published through another path.
-	 *
-	 * hdd_driver_mode_change() can sleep and must not run under
-	 * owly_owner_lock.  The remaining interleaving is with the root
-	 * watchdog's own con_mode=0 write: both paths serialize on
-	 * osif_driver_sync and hdd_driver_mode_change() is a no-op if
-	 * con_mode is already mission.
-	 */
-	mutex_lock(&owly_owner_lock);
-	if (owly_owner_pid || owly_owner_generation != cleared_generation) {
-		mutex_unlock(&owly_owner_lock);
-		hdd_info("Owly new owner registered; skipping stale revert");
-		return;
+		owly_owner_state = OWLY_OWNER_POLLING;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		retry = true;
+		delay = OWLY_OWNER_POLL_MS;
+	} else if (attempt < OWLY_OWNER_REVERT_MAX_ATTEMPTS) {
+		owly_revert_attempt = attempt + 1;
+		retry = true;
+		delay = OWLY_OWNER_REVERT_RETRY_MS;
+	} else {
+		/*
+		 * Final failure: stop retrying, but clear the dead owner so a
+		 * new app registration is not blocked by a stale one.
+		 */
+		put_pid(owly_owner_pid);
+		owly_owner_pid = NULL;
+		owly_owner_pid_nr = 0;
+		owly_owner_generation++;
+		owly_owner_state = OWLY_OWNER_IDLE;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		clear = true;
 	}
 	mutex_unlock(&owly_owner_lock);
 
-	hdd_info("Owly owner exited; reverting to mission mode");
-	hdd_driver_mode_change(QDF_GLOBAL_MISSION_MODE);
+	if (success) {
+		hdd_info("Owly owner revert succeeded; ownership cleared");
+		return;
+	}
+	if (clear) {
+		hdd_err("Owly owner revert failed after %u attempts (%d); ownership cleared",
+			attempt, ret);
+		return;
+	}
+	if (retry) {
+		if (ret == -EAGAIN)
+			hdd_info_rl("Owly owner revert deferred; will re-poll");
+		else
+			hdd_err("Owly owner revert attempt %u failed (%d); retrying",
+				attempt, ret);
+		owly_owner_rearm(delay);
+	}
+}
+
+static void owly_owner_work_fn(struct work_struct *work)
+{
+	struct pid *pid;
+	unsigned long generation;
+	enum owly_owner_state state;
+
+	mutex_lock(&owly_owner_lock);
+	pid = owly_owner_pid;
+	generation = owly_owner_generation;
+	state = owly_owner_state;
+	if (pid)
+		get_pid(pid);
+	mutex_unlock(&owly_owner_lock);
+
+	if (!pid || state == OWLY_OWNER_IDLE) {
+		put_pid(pid);
+		return;
+	}
+
+	switch (state) {
+	case OWLY_OWNER_POLLING:
+		owly_owner_poll_step(pid, generation);
+		break;
+	case OWLY_OWNER_GRACE:
+		owly_owner_grace_step(pid, generation);
+		break;
+	case OWLY_OWNER_REVERTING:
+		owly_owner_revert_step(pid, generation);
+		break;
+	case OWLY_OWNER_IDLE:
+	default:
+		break;
+	}
+
+	put_pid(pid);
 }
 
 static int owly_owner_pid_set(const char *kmessage,
@@ -16756,7 +17012,7 @@ static int owly_owner_pid_set(const char *kmessage,
 {
 	struct pid *new_pid = NULL;
 	struct pid *old_pid;
-	struct pid *grace_pid;
+	enum owly_owner_state old_state;
 	int nr;
 	int ret;
 
@@ -16766,36 +17022,40 @@ static int owly_owner_pid_set(const char *kmessage,
 
 	if (nr > 0) {
 		new_pid = find_get_pid(nr);
-		if (!new_pid)
+		if (!new_pid) {
+			hdd_err("Owly owner PID %d not found; keeping owner %d",
+				nr, READ_ONCE(owly_owner_pid_nr));
 			return -ESRCH;
+		}
 	}
 
 	/*
-	 * Cancel pending callbacks before publishing the new owner.  This
-	 * guarantees a grace/revert queued for the old owner cannot run after
-	 * the new owner becomes visible.  If a revert is already executing,
-	 * cancel waits for the driver reinit to finish and the new owner is
-	 * registered afterwards, starting from mission mode.
+	 * Never use cancel_delayed_work_sync() here: this runs in the sysfs
+	 * write context and the work may be inside hdd_driver_mode_change(),
+	 * which can block for the DSC timeout.  An asynchronous cancel plus
+	 * the generation check is sufficient; a running callback will see the
+	 * new owner and abandon its old attempt.
 	 */
-	cancel_delayed_work_sync(&owly_owner_poll_work);
-	cancel_delayed_work_sync(&owly_owner_grace_work);
+	cancel_delayed_work(&owly_owner_work);
 
 	mutex_lock(&owly_owner_lock);
 	old_pid = owly_owner_pid;
-	grace_pid = owly_grace_pid;
+	old_state = owly_owner_state;
 	owly_owner_pid = new_pid;
 	owly_owner_pid_nr = nr > 0 ? nr : 0;
-	owly_grace_pid = NULL;
-	owly_grace_generation = 0;
 	owly_owner_generation++;
+	owly_owner_state = new_pid ? OWLY_OWNER_POLLING : OWLY_OWNER_IDLE;
+	owly_grace_deadline = 0;
+	owly_revert_attempt = 0;
 	mutex_unlock(&owly_owner_lock);
 
 	put_pid(old_pid);
-	put_pid(grace_pid);
+
+	if (old_state == OWLY_OWNER_REVERTING)
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
 
 	if (new_pid)
-		owly_owner_queue(&owly_owner_poll_work,
-				 msecs_to_jiffies(OWLY_OWNER_POLL_MS));
+		owly_owner_rearm(OWLY_OWNER_POLL_MS);
 
 	return 0;
 }
@@ -16807,8 +17067,7 @@ static const struct kernel_param_ops owly_owner_pid_ops = {
 
 static void owly_owner_init(void)
 {
-	INIT_DELAYED_WORK(&owly_owner_poll_work, owly_owner_poll_fn);
-	INIT_DELAYED_WORK(&owly_owner_grace_work, owly_owner_grace_fn);
+	INIT_DELAYED_WORK(&owly_owner_work, owly_owner_work_fn);
 	owly_owner_wq = alloc_ordered_workqueue("owly_owner", WQ_MEM_RECLAIM);
 	if (!owly_owner_wq)
 		hdd_err("Owly owner workqueue allocation failed; using system_wq");
@@ -16817,21 +17076,22 @@ static void owly_owner_init(void)
 static void owly_owner_exit(void)
 {
 	struct pid *pid;
-	struct pid *grace_pid;
 
-	cancel_delayed_work_sync(&owly_owner_poll_work);
-	cancel_delayed_work_sync(&owly_owner_grace_work);
+	/*
+	 * Module exit is the only place where blocking cancellation is safe:
+	 * it is not the sysfs write path, and the driver is going away.
+	 */
+	cancel_delayed_work_sync(&owly_owner_work);
 	mutex_lock(&owly_owner_lock);
 	pid = owly_owner_pid;
-	grace_pid = owly_grace_pid;
 	owly_owner_pid = NULL;
 	owly_owner_pid_nr = 0;
-	owly_grace_pid = NULL;
-	owly_grace_generation = 0;
 	owly_owner_generation++;
+	owly_owner_state = OWLY_OWNER_IDLE;
+	owly_grace_deadline = 0;
+	owly_revert_attempt = 0;
 	mutex_unlock(&owly_owner_lock);
 	put_pid(pid);
-	put_pid(grace_pid);
 
 	if (owly_owner_wq) {
 		destroy_workqueue(owly_owner_wq);
