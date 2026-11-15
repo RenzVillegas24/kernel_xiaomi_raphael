@@ -1848,6 +1848,8 @@ static int __wlan_hdd_cfg80211_resume_wlan(struct wiphy *wiphy)
 
 	hdd_ctx->is_wiphy_suspended = false;
 
+	hdd_owly_owner_resume();
+
 	hdd_ctx->suspend_resume_stats.resumes++;
 	exit_code = 0;
 
@@ -2093,6 +2095,8 @@ static int __wlan_hdd_cfg80211_suspend_wlan(struct wiphy *wiphy,
 	}
 
 	hdd_ctx->is_wiphy_suspended = true;
+
+	hdd_owly_owner_suspend();
 
 	hdd_exit();
 	return 0;

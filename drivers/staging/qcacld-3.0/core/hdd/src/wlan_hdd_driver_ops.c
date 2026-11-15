@@ -1200,14 +1200,33 @@ resume_cdp:
 int wlan_hdd_bus_suspend(void)
 {
 	struct wow_enable_params default_params = {0};
+	int err;
 
-	return __wlan_hdd_bus_suspend(default_params);
+	/*
+	 * Pause the monitor-owner watchdog before the bus goes down so it
+	 * cannot start a driver restart during suspend.  If the suspend
+	 * attempt fails, the PM core will not call our resume callback, so
+	 * resume the watchdog here.
+	 */
+	hdd_owly_owner_suspend();
+	err = __wlan_hdd_bus_suspend(default_params);
+	if (err)
+		hdd_owly_owner_resume();
+
+	return err;
 }
 
 #ifdef WLAN_SUSPEND_RESUME_TEST
 int wlan_hdd_unit_test_bus_suspend(struct wow_enable_params wow_params)
 {
-	return __wlan_hdd_bus_suspend(wow_params);
+	int err;
+
+	hdd_owly_owner_suspend();
+	err = __wlan_hdd_bus_suspend(wow_params);
+	if (err)
+		hdd_owly_owner_resume();
+
+	return err;
 }
 #endif
 
@@ -1308,6 +1327,13 @@ int wlan_hdd_bus_resume(void)
 	int status;
 	QDF_STATUS qdf_status;
 	void *dp_soc;
+
+	/*
+	 * The platform is resuming even if the WLAN resume below fails or is
+	 * skipped, so restart the watchdog state machine here rather than
+	 * leaving it paused.
+	 */
+	hdd_owly_owner_resume();
 
 	if (cds_is_driver_recovering())
 		return 0;

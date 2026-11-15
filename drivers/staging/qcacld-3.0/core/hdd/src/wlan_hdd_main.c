@@ -16644,7 +16644,7 @@ static int hdd_driver_mode_change_nowait(enum QDF_GLOBAL_MODE mode)
 #define OWLY_OWNER_GRACE_STEP_MS 500
 #define OWLY_OWNER_REVERT_RETRY_MS 1000
 #define OWLY_OWNER_REVERT_MAX_ATTEMPTS 3
-#define OWLY_OWNER_SUSPEND_RETRY_MS 5000
+#define OWLY_OWNER_RESUME_DELAY_MS 5000
 
 enum owly_owner_state {
 	OWLY_OWNER_IDLE,
@@ -16664,6 +16664,27 @@ static struct delayed_work owly_owner_work;
 static struct workqueue_struct *owly_owner_wq;
 
 /*
+ * System suspend flag.  Protected by a separate spinlock because
+ * owly_owner_rearm() is called from the work callback, the sysfs setter and
+ * the resume hook.  While set, no delayed work is queued; the platform resume
+ * hook re-arms the state machine.  This avoids 1-5 s wakeups through suspend.
+ */
+static DEFINE_SPINLOCK(owly_owner_suspend_lock);
+static bool owly_owner_suspended;
+
+static bool owly_owner_is_suspended(void)
+{
+	unsigned long flags;
+	bool suspended;
+
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	suspended = owly_owner_suspended;
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+
+	return suspended;
+}
+
+/*
  * hdd_driver_mode_change() performs a full driver stop/restart and can sleep
  * for a long time.  Keep it on a dedicated ordered workqueue instead of
  * system_wq so it neither delays unrelated system work nor races the state
@@ -16673,12 +16694,22 @@ static struct workqueue_struct *owly_owner_wq;
  */
 static void owly_owner_rearm(unsigned long delay_ms)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	if (owly_owner_suspended) {
+		spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+		return;
+	}
+
 	if (owly_owner_wq)
 		queue_delayed_work(owly_owner_wq, &owly_owner_work,
 				   msecs_to_jiffies(delay_ms));
 	else
 		schedule_delayed_work(&owly_owner_work,
 				      msecs_to_jiffies(delay_ms));
+
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
 }
 
 /* Caller must hold owly_owner_lock. */
@@ -16698,21 +16729,14 @@ static void owly_owner_poll_step(struct pid *pid, unsigned long generation)
 	bool alive;
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
-	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+	if (owly_owner_is_suspended() ||
+	    (hdd_ctx && hdd_ctx->is_wiphy_suspended)) {
 		/*
-		 * Do not poll or start a grace/revert while the wiphy is
-		 * suspended.  The driver cannot be restarted safely, and a
-		 * longer interval avoids 1 s wakeups through suspend.
+		 * Do not re-arm while suspended.  The platform resume hook
+		 * restarts the state machine; this avoids non-deferrable
+		 * wakeups through suspend.
 		 */
-		mutex_lock(&owly_owner_lock);
-		if (owly_owner_matches_locked(pid, generation,
-					      OWLY_OWNER_POLLING)) {
-			mutex_unlock(&owly_owner_lock);
-			hdd_info_rl("Owly owner poll deferred: wiphy suspended");
-			owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
-			return;
-		}
-		mutex_unlock(&owly_owner_lock);
+		hdd_info_rl("Owly owner poll paused: suspended");
 		return;
 	}
 
@@ -16790,13 +16814,14 @@ static void owly_owner_grace_step(struct pid *pid, unsigned long generation)
 	}
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
-	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+	if (owly_owner_is_suspended() ||
+	    (hdd_ctx && hdd_ctx->is_wiphy_suspended)) {
 		/*
-		 * Do not start a full driver stop/restart while the wiphy is
-		 * suspended.  Keep the owner and re-check after resume.
+		 * Keep the owner and stop re-arming.  The platform resume
+		 * hook re-arms; the grace deadline is absolute, so a long
+		 * suspend does not extend the grace window.
 		 */
-		hdd_info_rl("Owly owner revert deferred: wiphy suspended");
-		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+		hdd_info_rl("Owly owner grace paused: suspended");
 		return;
 	}
 
@@ -16871,9 +16896,14 @@ static void owly_owner_revert_step(struct pid *pid, unsigned long generation)
 	}
 
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
-	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
-		hdd_info_rl("Owly owner revert deferred: wiphy suspended");
-		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+	if (owly_owner_is_suspended() ||
+	    (hdd_ctx && hdd_ctx->is_wiphy_suspended)) {
+		/*
+		 * Do not start a driver restart while suspended, and do not
+		 * re-arm; the platform resume hook will restart the state
+		 * machine.
+		 */
+		hdd_info_rl("Owly owner revert paused: suspended");
 		return;
 	}
 
@@ -16899,8 +16929,13 @@ static void owly_owner_revert_step(struct pid *pid, unsigned long generation)
 	mutex_lock(&owly_owner_lock);
 	if (!owly_owner_matches_locked(pid, generation,
 				       OWLY_OWNER_REVERTING)) {
+		int new_owner = owly_owner_pid_nr;
+		enum owly_owner_state new_state = owly_owner_state;
+
 		mutex_unlock(&owly_owner_lock);
-		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		mode = hdd_get_conparam();
+		hdd_info("Owly owner appeared during revert (pid %d, state %d, con_mode %d); not clearing or retrying",
+			 new_owner, new_state, mode);
 		return;
 	}
 
@@ -16952,20 +16987,25 @@ static void owly_owner_revert_step(struct pid *pid, unsigned long generation)
 	mutex_unlock(&owly_owner_lock);
 
 	if (success) {
-		hdd_info("Owly owner revert succeeded; ownership cleared");
+		mode = hdd_get_conparam();
+		hdd_info("Owly owner revert succeeded; con_mode=%d; ownership cleared",
+			 mode);
 		return;
 	}
 	if (clear) {
-		hdd_err("Owly owner revert failed after %u attempts (%d); ownership cleared",
-			attempt, ret);
+		mode = hdd_get_conparam();
+		hdd_err("Owly owner revert failed after %u attempts (%d); con_mode=%d; ownership cleared",
+			attempt, ret, mode);
 		return;
 	}
 	if (retry) {
+		mode = hdd_get_conparam();
 		if (ret == -EAGAIN)
-			hdd_info_rl("Owly owner revert deferred; will re-poll");
+			hdd_info_rl("Owly owner revert deferred (con_mode=%d); will re-poll",
+				    mode);
 		else
-			hdd_err("Owly owner revert attempt %u failed (%d); retrying",
-				attempt, ret);
+			hdd_err("Owly owner revert attempt %u failed (%d, con_mode=%d); retrying",
+				attempt, ret, mode);
 		owly_owner_rearm(delay);
 	}
 }
@@ -17005,6 +17045,60 @@ static void owly_owner_work_fn(struct work_struct *work)
 	}
 
 	put_pid(pid);
+}
+
+/**
+ * hdd_owly_owner_suspend() - pause the owner watchdog for system suspend
+ *
+ * Called from the platform bus suspend path (which also runs in monitor mode,
+ * unlike the cfg80211 suspend path) and the cfg80211 suspend path.  The
+ * delayed work is cancelled asynchronously and no new work is queued until
+ * hdd_owly_owner_resume().  A callback that is already running checks
+ * owly_owner_suspended and returns without re-arming.
+ */
+void hdd_owly_owner_suspend(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	owly_owner_suspended = true;
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+
+	hdd_info("Owly owner watchdog paused for suspend");
+	cancel_delayed_work(&owly_owner_work);
+}
+
+/**
+ * hdd_owly_owner_resume() - resume the owner watchdog after system resume
+ *
+ * Called from the platform bus resume path and the cfg80211 resume path.
+ * Re-arms the work after a short delay if an owner is still registered and
+ * the state machine is not idle.
+ */
+void hdd_owly_owner_resume(void)
+{
+	unsigned long flags;
+	bool rearm = false;
+
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	owly_owner_suspended = false;
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+
+	mutex_lock(&owly_owner_lock);
+	if (owly_owner_pid && owly_owner_state != OWLY_OWNER_IDLE)
+		rearm = true;
+	mutex_unlock(&owly_owner_lock);
+
+	/*
+	 * Delay the first post-resume poll so the driver resume has time to
+	 * finish.  If a transition is still active, the work backs off with
+	 * -EAGAIN and polls again.  This is a single delayed wakeup, not a
+	 * periodic timer through suspend.
+	 */
+	if (rearm) {
+		hdd_info("Owly owner watchdog resumed");
+		owly_owner_rearm(OWLY_OWNER_RESUME_DELAY_MS);
+	}
 }
 
 static int owly_owner_pid_set(const char *kmessage,
@@ -17067,7 +17161,14 @@ static const struct kernel_param_ops owly_owner_pid_ops = {
 
 static void owly_owner_init(void)
 {
+	unsigned long flags;
+
 	INIT_DELAYED_WORK(&owly_owner_work, owly_owner_work_fn);
+
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	owly_owner_suspended = false;
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+
 	owly_owner_wq = alloc_ordered_workqueue("owly_owner", WQ_MEM_RECLAIM);
 	if (!owly_owner_wq)
 		hdd_err("Owly owner workqueue allocation failed; using system_wq");
@@ -17076,14 +17177,32 @@ static void owly_owner_init(void)
 static void owly_owner_exit(void)
 {
 	struct pid *pid;
+	bool was_reverting;
+	unsigned long flags;
 
 	/*
-	 * Module exit is the only place where blocking cancellation is safe:
-	 * it is not the sysfs write path, and the driver is going away.
+	 * This path is not exercised on the current build because WLAN is
+	 * built-in (CONFIG_QCA_CLD_WLAN=y).  Keep it correct for a
+	 * hypothetical module build:
+	 *
+	 * 1. Stop new re-arms and clear ownership/state first, so a callback
+	 *    that is already running sees IDLE and does not retry or clear a
+	 *    new owner.
+	 * 2. Cancel the pending delayed work asynchronously.  Do not use
+	 *    cancel_delayed_work_sync() here: the callback may be inside
+	 *    hdd_driver_mode_change(), which can block for the DSC timeout.
+	 * 3. Destroy the workqueue.  destroy_workqueue() still waits for a
+	 *    callback that is already in flight, but only for that one
+	 *    invocation; the state is IDLE, so it will not retry.  If the
+	 *    driver call itself is hung, a safe module unload is impossible.
 	 */
-	cancel_delayed_work_sync(&owly_owner_work);
+	spin_lock_irqsave(&owly_owner_suspend_lock, flags);
+	owly_owner_suspended = true;
+	spin_unlock_irqrestore(&owly_owner_suspend_lock, flags);
+
 	mutex_lock(&owly_owner_lock);
 	pid = owly_owner_pid;
+	was_reverting = (owly_owner_state == OWLY_OWNER_REVERTING);
 	owly_owner_pid = NULL;
 	owly_owner_pid_nr = 0;
 	owly_owner_generation++;
@@ -17092,6 +17211,11 @@ static void owly_owner_exit(void)
 	owly_revert_attempt = 0;
 	mutex_unlock(&owly_owner_lock);
 	put_pid(pid);
+
+	cancel_delayed_work(&owly_owner_work);
+
+	if (was_reverting)
+		hdd_info("Owly owner exit: waiting for in-flight revert");
 
 	if (owly_owner_wq) {
 		destroy_workqueue(owly_owner_wq);
