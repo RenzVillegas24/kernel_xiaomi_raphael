@@ -16584,22 +16584,47 @@ exit:
  * The app writes its PID to /sys/module/wlan/parameters/owly_owner_pid while
  * AirDrop mode is active. If the app process disappears (force-stop, crash,
  * LMK), the driver returns to mission mode so normal Wi-Fi can recover.
+ *
+ * Ownership is versioned: every write to owly_owner_pid (new PID or 0) bumps
+ * owly_owner_generation.  A callback only acts if both the captured pid
+ * pointer and generation still match the current registration, so a work item
+ * queued for an old owner can never revert a new owner's monitor session.
  */
 #define OWLY_OWNER_POLL_MS 500
+#define OWLY_OWNER_GRACE_MS 1500
 
 static DEFINE_MUTEX(owly_owner_lock);
 static struct pid *owly_owner_pid;
 static int owly_owner_pid_nr;
 static unsigned long owly_owner_generation;
-static struct delayed_work owly_owner_work;
+static struct delayed_work owly_owner_poll_work;
+static struct delayed_work owly_owner_grace_work;
+static struct pid *owly_grace_pid;
+static unsigned long owly_grace_generation;
+static struct workqueue_struct *owly_owner_wq;
 
-static void owly_owner_work_fn(struct work_struct *work)
+/*
+ * hdd_driver_mode_change() performs a full driver stop/restart and can sleep
+ * for a long time.  Keep it on a dedicated ordered workqueue instead of
+ * system_wq so it neither delays unrelated system work nor races the poll
+ * callback.  Fall back to system_wq only if allocation fails.
+ */
+static void owly_owner_queue(struct delayed_work *work, unsigned long delay)
+{
+	if (owly_owner_wq)
+		queue_delayed_work(owly_owner_wq, work, delay);
+	else
+		schedule_delayed_work(work, delay);
+}
+
+static void owly_owner_poll_fn(struct work_struct *work)
 {
 	struct pid *pid;
 	struct task_struct *task;
 	unsigned long generation;
 	bool alive;
-	bool revert = false;
+	bool still_owner;
+	bool queue_grace = false;
 
 	mutex_lock(&owly_owner_lock);
 	pid = owly_owner_pid;
@@ -16617,26 +16642,113 @@ static void owly_owner_work_fn(struct work_struct *work)
 		put_task_struct(task);
 
 	if (alive) {
-		schedule_delayed_work(&owly_owner_work,
-				      msecs_to_jiffies(OWLY_OWNER_POLL_MS));
+		/*
+		 * The owner may have been replaced while the task lookup ran.
+		 * Only reschedule if this work still belongs to the registered
+		 * owner; the set path queues a fresh poll for a new owner.
+		 */
+		mutex_lock(&owly_owner_lock);
+		still_owner = owly_owner_pid == pid &&
+			      owly_owner_generation == generation;
+		mutex_unlock(&owly_owner_lock);
+
+		if (still_owner)
+			owly_owner_queue(&owly_owner_poll_work,
+					 msecs_to_jiffies(OWLY_OWNER_POLL_MS));
 		put_pid(pid);
 		return;
 	}
 
+	/*
+	 * The owner is gone, but do not revert yet.  The root watchdog gets
+	 * OWLY_OWNER_GRACE_MS to run "owly-mode.sh exit" (svc wifi disable ->
+	 * con_mode=0 -> svc wifi enable).  A delayed work item performs the
+	 * grace check; sleeping here would stall the workqueue.
+	 */
 	mutex_lock(&owly_owner_lock);
-	if (owly_owner_pid == pid && owly_owner_generation == generation) {
+	still_owner = owly_owner_pid == pid &&
+		      owly_owner_generation == generation;
+	if (still_owner && !owly_grace_pid) {
+		get_pid(pid);
+		owly_grace_pid = pid;
+		owly_grace_generation = generation;
+		queue_grace = true;
+	}
+	mutex_unlock(&owly_owner_lock);
+	put_pid(pid);
+
+	if (queue_grace)
+		owly_owner_queue(&owly_owner_grace_work,
+				 msecs_to_jiffies(OWLY_OWNER_GRACE_MS));
+}
+
+static void owly_owner_grace_fn(struct work_struct *work)
+{
+	struct pid *pid;
+	unsigned long generation;
+	unsigned long cleared_generation = 0;
+	enum QDF_GLOBAL_MODE mode;
+	bool revert = false;
+
+	mutex_lock(&owly_owner_lock);
+	pid = owly_grace_pid;
+	generation = owly_grace_generation;
+	owly_grace_pid = NULL;
+	owly_grace_generation = 0;
+
+	if (pid && owly_owner_pid == pid &&
+	    owly_owner_generation == generation) {
+		/*
+		 * Same dead owner is still registered.  Drop the ownership and
+		 * bump the generation so any stale callback fails its checks.
+		 */
 		put_pid(owly_owner_pid);
 		owly_owner_pid = NULL;
 		owly_owner_pid_nr = 0;
+		owly_owner_generation++;
+		cleared_generation = owly_owner_generation;
 		revert = true;
 	}
 	mutex_unlock(&owly_owner_lock);
 	put_pid(pid);
 
-	if (revert && hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE) {
-		hdd_info("Owly owner exited; reverting to mission mode");
-		hdd_driver_mode_change(QDF_GLOBAL_MISSION_MODE);
+	if (!revert)
+		return;
+
+	mode = hdd_get_conparam();
+	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		/*
+		 * The root watchdog already restored mission mode (or the mode
+		 * changed for another reason).  Never override that from the
+		 * kernel.
+		 */
+		hdd_info("Owly owner exited; con_mode already %d, no revert",
+			 mode);
+		return;
 	}
+
+	/*
+	 * Re-check after clearing ownership.  The set path cancels the grace
+	 * work before publishing a new owner, so a normal write cannot land
+	 * between these steps; this check is a defensive backstop in case
+	 * ownership is ever published through another path.
+	 *
+	 * hdd_driver_mode_change() can sleep and must not run under
+	 * owly_owner_lock.  The remaining interleaving is with the root
+	 * watchdog's own con_mode=0 write: both paths serialize on
+	 * osif_driver_sync and hdd_driver_mode_change() is a no-op if
+	 * con_mode is already mission.
+	 */
+	mutex_lock(&owly_owner_lock);
+	if (owly_owner_pid || owly_owner_generation != cleared_generation) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly new owner registered; skipping stale revert");
+		return;
+	}
+	mutex_unlock(&owly_owner_lock);
+
+	hdd_info("Owly owner exited; reverting to mission mode");
+	hdd_driver_mode_change(QDF_GLOBAL_MISSION_MODE);
 }
 
 static int owly_owner_pid_set(const char *kmessage,
@@ -16644,6 +16756,7 @@ static int owly_owner_pid_set(const char *kmessage,
 {
 	struct pid *new_pid = NULL;
 	struct pid *old_pid;
+	struct pid *grace_pid;
 	int nr;
 	int ret;
 
@@ -16657,19 +16770,32 @@ static int owly_owner_pid_set(const char *kmessage,
 			return -ESRCH;
 	}
 
+	/*
+	 * Cancel pending callbacks before publishing the new owner.  This
+	 * guarantees a grace/revert queued for the old owner cannot run after
+	 * the new owner becomes visible.  If a revert is already executing,
+	 * cancel waits for the driver reinit to finish and the new owner is
+	 * registered afterwards, starting from mission mode.
+	 */
+	cancel_delayed_work_sync(&owly_owner_poll_work);
+	cancel_delayed_work_sync(&owly_owner_grace_work);
+
 	mutex_lock(&owly_owner_lock);
 	old_pid = owly_owner_pid;
+	grace_pid = owly_grace_pid;
 	owly_owner_pid = new_pid;
 	owly_owner_pid_nr = nr > 0 ? nr : 0;
+	owly_grace_pid = NULL;
+	owly_grace_generation = 0;
 	owly_owner_generation++;
 	mutex_unlock(&owly_owner_lock);
 
 	put_pid(old_pid);
-	cancel_delayed_work_sync(&owly_owner_work);
+	put_pid(grace_pid);
 
 	if (new_pid)
-		schedule_delayed_work(&owly_owner_work,
-				      msecs_to_jiffies(OWLY_OWNER_POLL_MS));
+		owly_owner_queue(&owly_owner_poll_work,
+				 msecs_to_jiffies(OWLY_OWNER_POLL_MS));
 
 	return 0;
 }
@@ -16681,21 +16807,36 @@ static const struct kernel_param_ops owly_owner_pid_ops = {
 
 static void owly_owner_init(void)
 {
-	INIT_DELAYED_WORK(&owly_owner_work, owly_owner_work_fn);
+	INIT_DELAYED_WORK(&owly_owner_poll_work, owly_owner_poll_fn);
+	INIT_DELAYED_WORK(&owly_owner_grace_work, owly_owner_grace_fn);
+	owly_owner_wq = alloc_ordered_workqueue("owly_owner", WQ_MEM_RECLAIM);
+	if (!owly_owner_wq)
+		hdd_err("Owly owner workqueue allocation failed; using system_wq");
 }
 
 static void owly_owner_exit(void)
 {
 	struct pid *pid;
+	struct pid *grace_pid;
 
-	cancel_delayed_work_sync(&owly_owner_work);
+	cancel_delayed_work_sync(&owly_owner_poll_work);
+	cancel_delayed_work_sync(&owly_owner_grace_work);
 	mutex_lock(&owly_owner_lock);
 	pid = owly_owner_pid;
+	grace_pid = owly_grace_pid;
 	owly_owner_pid = NULL;
 	owly_owner_pid_nr = 0;
+	owly_grace_pid = NULL;
+	owly_grace_generation = 0;
 	owly_owner_generation++;
 	mutex_unlock(&owly_owner_lock);
 	put_pid(pid);
+	put_pid(grace_pid);
+
+	if (owly_owner_wq) {
+		destroy_workqueue(owly_owner_wq);
+		owly_owner_wq = NULL;
+	}
 }
 
 static int hdd_set_con_mode(enum QDF_GLOBAL_MODE mode)
