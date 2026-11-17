@@ -91,8 +91,21 @@ QDF_STATUS wma_inject_frame_via_vdev(void *wma_context, uint8_t tx_vdev_id,
 	mgmt_param.chanfreq = 0; /* match how real probe requests are sent */
 	mgmt_param.pdata = frame_data;
 	mgmt_param.qdf_ctx = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
-	mgmt_param.tx_params_valid = false;
+	/*
+	 * The monitor's radiotap rate is discarded before this WMI command. Ask
+	 * firmware for a concrete legacy rate instead of letting it pick its
+	 * management default: 54 Mbps OFDM, one spatial stream, 20 MHz, data.
+	 * This is the highest legacy rate the management-TX path understands;
+	 * HT/MCS is not available here.
+	 */
+	mgmt_param.tx_params_valid = true;
 	mgmt_param.use_6mbps = 0;
+	mgmt_param.tx_param.mcs_mask = 1 << 11; /* OFDM 64-QAM 3/4: 54 Mbps */
+	mgmt_param.tx_param.nss_mask = 1;       /* Nss=1 */
+	mgmt_param.tx_param.retry_limit = 4;
+	mgmt_param.tx_param.bw_mask = 1 << 2;   /* 20 MHz */
+	mgmt_param.tx_param.preamble_type = 1 << 0; /* OFDM */
+	mgmt_param.tx_param.frame_type = 1;     /* data */
 
 	/* NULL download/OTA completion callbacks => the completion handler just
 	 * frees the nbuf. mgmt-txrx takes its own peer ref for the lifetime of
