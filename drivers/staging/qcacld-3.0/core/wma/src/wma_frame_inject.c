@@ -100,7 +100,7 @@ QDF_STATUS wma_inject_frame_via_vdev(void *wma_context, uint8_t tx_vdev_id,
 	 */
 	mgmt_param.tx_params_valid = true;
 	mgmt_param.use_6mbps = 0;
-	mgmt_param.tx_param.mcs_mask = 1 << 10; /* OFDM 64-QAM 2/3: 48 Mbps */
+	mgmt_param.tx_param.mcs_mask = 1 << 11; /* OFDM 64-QAM 3/4: 54 Mbps */
 	mgmt_param.tx_param.nss_mask = 1;       /* Nss=1 */
 	mgmt_param.tx_param.retry_limit = 4;
 	mgmt_param.tx_param.bw_mask = 1 << 2;   /* 20 MHz */
