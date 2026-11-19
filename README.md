@@ -1,14 +1,14 @@
-# AirDroid kernel for the Redmi K20 Pro (`raphael`)
+# CrossPair kernel for the Redmi K20 Pro (`raphael`)
 
-This is the AirDroid kernel fork for the Redmi K20 Pro / Mi 9T Pro
+This is the CrossPair kernel fork for the Redmi K20 Pro / Mi 9T Pro
 (`raphael`, Qualcomm SM8150, WCN3990). It is based on
 [Evolution-X-Devices/kernel_xiaomi_raphael](https://github.com/Evolution-X-Devices/kernel_xiaomi_raphael)
-and adds the monitor-mode transmit support required by the AirDroid userspace
+and adds the monitor-mode transmit support required by the CrossPair userspace
 stack.
 
 This repository contains only the kernel side. The Android app, Rust helper,
 Owly AWDL/AirDrop implementation, build scripts, and release workflows live in
-[RenzVillegas24/AirDroid](https://github.com/RenzVillegas24/AirDroid).
+[RenzVillegas24/CrossPair](https://github.com/RenzVillegas24/CrossPair).
 
 ## What this kernel adds
 
@@ -60,7 +60,7 @@ audio, and compiler code touched by this configuration.
 ## How the pieces fit
 
 ```text
-AirDroid app
+CrossPair app
   └─ foreground service + controller
        └─ owly-k20-helper (Rust)
             └─ Owly AWDL/AirDrop stack
@@ -75,9 +75,9 @@ internal WCN3990; external USB Wi-Fi is out of scope.
 
 - Redmi K20 Pro / Mi 9T Pro only (`raphael`)
 - Unlocked bootloader
-- KernelSU root for the AirDroid app's radio-mode switch
+- KernelSU root for the CrossPair app's radio-mode switch
 - A boot image built from the matching kernel branch
-- The AirDroid app and helper from the main repository
+- The CrossPair app and helper from the main repository
 
 Do not flash a boot image built for another device or an unrelated kernel
 branch. Keep a backup of the stock boot image before flashing.
@@ -88,7 +88,7 @@ prebuilt boot images or flashing automation.
 
 ## Branches
 
-- `AirDroid/main` — production AirDroid kernel source
+- `CrossPair/main` — production CrossPair kernel source
 - `upstream-pr/airdrop-k20` — kernel changes submitted upstream to
   [Evolution-X-Devices/kernel_xiaomi_raphael](https://github.com/Evolution-X-Devices/kernel_xiaomi_raphael/pull/1)
 
